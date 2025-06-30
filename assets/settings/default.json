@@ -1711,7 +1711,7 @@
     // Specify the LSP name as a key here.
     // "rust-analyzer": {
     //     // A special flag for rust-analyzer integration, to use server-provided tasks
-    //     enable_lsp_tasks": true,
+    //     "enable_lsp_tasks": true,
     //     // These initialization options are merged into Zed's defaults
     //     "initialization_options": {
     //         "check": {
