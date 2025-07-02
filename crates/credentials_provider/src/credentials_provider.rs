@@ -49,6 +49,31 @@ pub trait CredentialsProvider: Send + Sync {
         url: &'a str,
         cx: &'a AsyncApp,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
+
+    /// Reads OAuth tokens from the provider.
+    /// Default implementation stores tokens with "oauth_tokens_" prefix.
+    fn read_oauth_tokens<'a>(
+        &'a self,
+        provider: &'a str,
+        cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>>> + 'a>>;
+
+    /// Writes OAuth tokens to the provider.
+    /// Default implementation stores tokens with "oauth_tokens_" prefix.
+    fn write_oauth_tokens<'a>(
+        &'a self,
+        provider: &'a str,
+        tokens: &'a [u8],
+        cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
+
+    /// Deletes OAuth tokens from the provider.
+    /// Default implementation deletes tokens with "oauth_tokens_" prefix.
+    fn delete_oauth_tokens<'a>(
+        &'a self,
+        provider: &'a str,
+        cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
 }
 
 impl dyn CredentialsProvider {
@@ -115,6 +140,45 @@ impl CredentialsProvider for KeychainCredentialsProvider {
         cx: &'a AsyncApp,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
         async move { cx.update(move |cx| cx.delete_credentials(url))?.await }.boxed_local()
+    }
+
+    fn read_oauth_tokens<'a>(
+        &'a self,
+        provider: &'a str,
+        cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>>> + 'a>> {
+        async move {
+            let url = format!("oauth_tokens_{}", provider);
+            let result = cx.update(|cx| cx.read_credentials(&url))?.await?;
+            Ok(result.map(|(_, tokens)| tokens))
+        }
+        .boxed_local()
+    }
+
+    fn write_oauth_tokens<'a>(
+        &'a self,
+        provider: &'a str,
+        tokens: &'a [u8],
+        cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        async move {
+            let url = format!("oauth_tokens_{}", provider);
+            cx.update(move |cx| cx.write_credentials(&url, "oauth", tokens))?
+                .await
+        }
+        .boxed_local()
+    }
+
+    fn delete_oauth_tokens<'a>(
+        &'a self,
+        provider: &'a str,
+        cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        async move {
+            let url = format!("oauth_tokens_{}", provider);
+            cx.update(move |cx| cx.delete_credentials(&url))?.await
+        }
+        .boxed_local()
     }
 }
 
@@ -191,6 +255,54 @@ impl CredentialsProvider for DevelopmentCredentialsProvider {
         async move {
             let mut credentials = self.load_credentials()?;
             credentials.remove(url);
+
+            self.save_credentials(&credentials)
+        }
+        .boxed_local()
+    }
+
+    fn read_oauth_tokens<'a>(
+        &'a self,
+        provider: &'a str,
+        _cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>>> + 'a>> {
+        async move {
+            let url = format!("oauth_tokens_{}", provider);
+            let result = self
+                .load_credentials()
+                .unwrap_or_default()
+                .get(&url)
+                .cloned();
+            Ok(result.map(|(_, tokens)| tokens))
+        }
+        .boxed_local()
+    }
+
+    fn write_oauth_tokens<'a>(
+        &'a self,
+        provider: &'a str,
+        tokens: &'a [u8],
+        _cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        async move {
+            let url = format!("oauth_tokens_{}", provider);
+            let mut credentials = self.load_credentials().unwrap_or_default();
+            credentials.insert(url, ("oauth".to_string(), tokens.to_vec()));
+
+            self.save_credentials(&credentials)
+        }
+        .boxed_local()
+    }
+
+    fn delete_oauth_tokens<'a>(
+        &'a self,
+        provider: &'a str,
+        _cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        async move {
+            let url = format!("oauth_tokens_{}", provider);
+            let mut credentials = self.load_credentials()?;
+            credentials.remove(&url);
 
             self.save_credentials(&credentials)
         }

@@ -2,7 +2,7 @@ use crate::AllLanguageModelSettings;
 use crate::ui::InstructionListItem;
 use anthropic::{
     AnthropicError, AnthropicModelMode, ContentDelta, Event, ResponseContent, ToolResultContent,
-    ToolResultPart, Usage,
+    ToolResultPart, Usage, oauth::{OAuthTokens, AnthropicOAuthManager},
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{BTreeMap, HashMap};
@@ -99,13 +99,39 @@ pub struct AnthropicLanguageModelProvider {
 
 const ANTHROPIC_API_KEY_VAR: &str = "ANTHROPIC_API_KEY";
 
+#[derive(Debug, Clone)]
+pub enum AnthropicAuthMethod {
+    None,
+    ApiKey {
+        key: String,
+        from_env: bool,
+    },
+    OAuth {
+        tokens: OAuthTokens,
+    },
+}
+
+impl AnthropicAuthMethod {
+    pub fn is_authenticated(&self) -> bool {
+        match self {
+            AnthropicAuthMethod::None => false,
+            AnthropicAuthMethod::ApiKey { .. } => true,
+            AnthropicAuthMethod::OAuth { tokens } => !tokens.is_expired(),
+        }
+    }
+}
+
 pub struct State {
-    api_key: Option<String>,
-    api_key_from_env: bool,
+    auth_method: AnthropicAuthMethod,
+    oauth_manager: Option<AnthropicOAuthManager>,
     _subscription: Subscription,
 }
 
 impl State {
+    fn is_oauth_authenticated(&self) -> bool {
+        matches!(self.auth_method, AnthropicAuthMethod::OAuth { .. })
+    }
+
     fn reset_api_key(&self, cx: &mut Context<Self>) -> Task<Result<()>> {
         let credentials_provider = <dyn CredentialsProvider>::global(cx);
         let api_url = AllLanguageModelSettings::get_global(cx)
@@ -113,13 +139,18 @@ impl State {
             .api_url
             .clone();
         cx.spawn(async move |this, cx| {
+            // Delete both API key and OAuth credentials
             credentials_provider
                 .delete_credentials(&api_url, &cx)
                 .await
                 .ok();
+            credentials_provider
+                .delete_oauth_tokens("anthropic", &cx)
+                .await
+                .ok();
+            
             this.update(cx, |this, cx| {
-                this.api_key = None;
-                this.api_key_from_env = false;
+                this.auth_method = AnthropicAuthMethod::None;
                 cx.notify();
             })
         })
@@ -132,20 +163,87 @@ impl State {
             .api_url
             .clone();
         cx.spawn(async move |this, cx| {
+            // Clear any existing OAuth tokens (exclusive authentication)
+            credentials_provider
+                .delete_oauth_tokens("anthropic", &cx)
+                .await
+                .ok();
+            
             credentials_provider
                 .write_credentials(&api_url, "Bearer", api_key.as_bytes(), &cx)
                 .await
                 .ok();
 
             this.update(cx, |this, cx| {
-                this.api_key = Some(api_key);
+                this.auth_method = AnthropicAuthMethod::ApiKey {
+                    key: api_key,
+                    from_env: false,
+                };
                 cx.notify();
             })
         })
     }
 
+    fn authenticate_oauth(&self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        if let Some(oauth_manager) = &self.oauth_manager {
+            let oauth_manager = oauth_manager.clone();
+            let credentials_provider = <dyn CredentialsProvider>::global(cx);
+            let api_url = AllLanguageModelSettings::get_global(cx)
+                .anthropic
+                .api_url
+                .clone();
+            cx.spawn(async move |this, cx| {
+                let tokens = oauth_manager.authenticate().await?;
+                
+                // Clear any existing API key (exclusive authentication)
+                credentials_provider
+                    .delete_credentials(&api_url, &cx)
+                    .await
+                    .ok();
+                
+                // Store the OAuth tokens securely
+                let tokens_json = serde_json::to_vec(&tokens)
+                    .context("Failed to serialize OAuth tokens")?;
+                credentials_provider
+                    .write_oauth_tokens("anthropic", &tokens_json, &cx)
+                    .await
+                    .context("Failed to store OAuth tokens")?;
+                
+                this.update(cx, |this, cx| {
+                    this.auth_method = AnthropicAuthMethod::OAuth { tokens };
+                    cx.notify();
+                })?;
+                Ok(())
+            })
+        } else {
+            Task::ready(Err(anyhow!("OAuth manager not available")))
+        }
+    }
+
+    fn load_oauth_tokens(&self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let credentials_provider = <dyn CredentialsProvider>::global(cx);
+        cx.spawn(async move |this, cx| {
+            if let Some(tokens_bytes) = credentials_provider
+                .read_oauth_tokens("anthropic", &cx)
+                .await?
+            {
+                let tokens: OAuthTokens = serde_json::from_slice(&tokens_bytes)
+                    .context("Failed to deserialize OAuth tokens")?;
+                
+                // Check if tokens are still valid
+                if !tokens.is_expired() {
+                    this.update(cx, |this, cx| {
+                        this.auth_method = AnthropicAuthMethod::OAuth { tokens };
+                        cx.notify();
+                    })?;
+                }
+            }
+            Ok(())
+        })
+    }
+
     fn is_authenticated(&self) -> bool {
-        self.api_key.is_some()
+        self.auth_method.is_authenticated()
     }
 
     fn authenticate(&self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
@@ -160,35 +258,90 @@ impl State {
             .clone();
 
         cx.spawn(async move |this, cx| {
-            let (api_key, from_env) = if let Ok(api_key) = std::env::var(ANTHROPIC_API_KEY_VAR) {
-                (api_key, true)
-            } else {
-                let (_, api_key) = credentials_provider
-                    .read_credentials(&api_url, &cx)
-                    .await?
-                    .ok_or(AuthenticateError::CredentialsNotFound)?;
-                (
-                    String::from_utf8(api_key).context("invalid {PROVIDER_NAME} API key")?,
-                    false,
-                )
-            };
+            // Try environment variable first
+            if let Ok(api_key) = std::env::var(ANTHROPIC_API_KEY_VAR) {
+                this.update(cx, |this, cx| {
+                    this.auth_method = AnthropicAuthMethod::ApiKey {
+                        key: api_key,
+                        from_env: true,
+                    };
+                    cx.notify();
+                })?;
+                return Ok(());
+            }
 
-            this.update(cx, |this, cx| {
-                this.api_key = Some(api_key);
-                this.api_key_from_env = from_env;
-                cx.notify();
-            })?;
+            // Try stored API key credentials
+            if let Some((_, api_key_bytes)) = credentials_provider
+                .read_credentials(&api_url, &cx)
+                .await?
+            {
+                let api_key = String::from_utf8(api_key_bytes)
+                    .context("invalid Anthropic API key")?;
+                this.update(cx, |this, cx| {
+                    this.auth_method = AnthropicAuthMethod::ApiKey {
+                        key: api_key,
+                        from_env: false,
+                    };
+                    cx.notify();
+                })?;
+                return Ok(());
+            }
 
-            Ok(())
+            // Try OAuth tokens
+            if let Some(tokens_bytes) = credentials_provider
+                .read_oauth_tokens("anthropic", &cx)
+                .await?
+            {
+                let tokens: OAuthTokens = serde_json::from_slice(&tokens_bytes)
+                    .context("Failed to deserialize OAuth tokens")?;
+                
+                // Check if tokens are still valid or can be refreshed
+                if !tokens.is_expired() {
+                    this.update(cx, |this, cx| {
+                        this.auth_method = AnthropicAuthMethod::OAuth { tokens };
+                        cx.notify();
+                    })?;
+                    return Ok(());
+                } else if let Some(oauth_manager) = this.read_with(cx, |this, _| this.oauth_manager.clone())? {
+                    // Try to refresh the tokens
+                    match oauth_manager.refresh_tokens(&tokens.refresh_token).await {
+                        Ok(new_tokens) => {
+                            // Store the refreshed tokens
+                            let tokens_json = serde_json::to_vec(&new_tokens)
+                                .context("Failed to serialize refreshed OAuth tokens")?;
+                            credentials_provider
+                                .write_oauth_tokens("anthropic", &tokens_json, &cx)
+                                .await
+                                .context("Failed to store refreshed OAuth tokens")?;
+                            
+                            this.update(cx, |this, cx| {
+                                this.auth_method = AnthropicAuthMethod::OAuth { tokens: new_tokens };
+                                cx.notify();
+                            })?;
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            // Token refresh failed, remove invalid tokens
+                            credentials_provider
+                                .delete_oauth_tokens("anthropic", &cx)
+                                .await
+                                .ok();
+                        }
+                    }
+                }
+            }
+            
+            Err(AuthenticateError::CredentialsNotFound)
         })
     }
 }
 
 impl AnthropicLanguageModelProvider {
     pub fn new(http_client: Arc<dyn HttpClient>, cx: &mut App) -> Self {
+        let oauth_manager = AnthropicOAuthManager::new(http_client.clone());
         let state = cx.new(|cx| State {
-            api_key: None,
-            api_key_from_env: false,
+            auth_method: AnthropicAuthMethod::None,
+            oauth_manager: Some(oauth_manager),
             _subscription: cx.observe_global::<SettingsStore>(|_, cx| {
                 cx.notify();
             }),
@@ -204,6 +357,49 @@ impl AnthropicLanguageModelProvider {
             state: self.state.clone(),
             http_client: self.http_client.clone(),
             request_limiter: RateLimiter::new(4),
+        })
+    }
+
+    /// Start OAuth authentication flow
+    pub fn start_oauth_authentication(&self, cx: &mut App) -> Task<Result<()>> {
+        self.state.update(cx, |state, cx| {
+            state.authenticate_oauth(cx)
+        })
+    }
+
+    /// Check if OAuth authentication is active
+    pub fn is_oauth_authenticated(&self, cx: &App) -> bool {
+        self.state.read(cx).is_oauth_authenticated()
+    }
+
+    /// Get current authentication method
+    pub fn auth_method(&self, cx: &App) -> AnthropicAuthMethod {
+        self.state.read(cx).auth_method.clone()
+    }
+
+    /// Reset authentication (clears tokens and falls back to API key)
+    pub fn reset_authentication(&self, cx: &mut App) -> Task<Result<()>> {
+        self.state.update(cx, |_state, cx| {
+            cx.spawn(async move |this, cx| {
+                // Clear OAuth tokens if they exist
+                if let Ok(credentials_provider) = cx.update(|cx| <dyn CredentialsProvider>::global(cx)) {
+                    let _ = credentials_provider
+                        .delete_oauth_tokens("anthropic", &cx)
+                        .await;
+                }
+
+                // Reset to API key authentication
+                this.update(cx, |this, cx| {
+                    this.auth_method = if let Ok(api_key) = std::env::var(ANTHROPIC_API_KEY_VAR) {
+                        AnthropicAuthMethod::ApiKey { key: api_key, from_env: true }
+                    } else {
+                        AnthropicAuthMethod::None
+                    };
+                    cx.notify();
+                })?;
+
+                Ok(())
+            })
         })
     }
 }
@@ -395,22 +591,39 @@ impl AnthropicModel {
     > {
         let http_client = self.http_client.clone();
 
-        let Ok((api_key, api_url)) = cx.read_entity(&self.state, |state, cx| {
+        let Ok((auth_method, api_url)) = cx.read_entity(&self.state, |state, cx| {
             let settings = &AllLanguageModelSettings::get_global(cx).anthropic;
-            (state.api_key.clone(), settings.api_url.clone())
+            (state.auth_method.clone(), settings.api_url.clone())
         }) else {
             return futures::future::ready(Err(anyhow!("App state dropped").into())).boxed();
         };
 
         async move {
-            let Some(api_key) = api_key else {
-                return Err(LanguageModelCompletionError::NoApiKey {
-                    provider: PROVIDER_NAME,
-                });
-            };
-            let request =
-                anthropic::stream_completion(http_client.as_ref(), &api_url, &api_key, request);
-            request.await.map_err(Into::into)
+            match auth_method {
+                AnthropicAuthMethod::ApiKey { key, .. } => {
+                    let request = anthropic::stream_completion(
+                        http_client.as_ref(),
+                        &api_url,
+                        &key,
+                        request,
+                    );
+                    request.await.map_err(Into::into)
+                }
+                AnthropicAuthMethod::OAuth { tokens } => {
+                    let request = anthropic::stream_completion_oauth_with_rate_limit_info(
+                        http_client.as_ref(),
+                        &api_url,
+                        &tokens.access_token,
+                        request,
+                    );
+                    request.await.map(|(stream, _)| stream).map_err(Into::into)
+                }
+                AnthropicAuthMethod::None => {
+                    Err(LanguageModelCompletionError::NoApiKey {
+                        provider: PROVIDER_NAME,
+                    })
+                }
+            }
         }
         .boxed()
     }
@@ -454,7 +667,10 @@ impl LanguageModel for AnthropicModel {
     }
 
     fn api_key(&self, cx: &App) -> Option<String> {
-        self.state.read(cx).api_key.clone()
+        match &self.state.read(cx).auth_method {
+            AnthropicAuthMethod::ApiKey { key, .. } => Some(key.clone()),
+            _ => None,
+        }
     }
 
     fn max_token_count(&self) -> u64 {
@@ -970,6 +1186,16 @@ impl ConfigurationView {
         cx.notify();
     }
 
+    fn start_oauth_authentication(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self.state.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            state.update(cx, |state, cx| state.authenticate_oauth(cx))?.await
+        })
+        .detach_and_log_err(cx);
+
+        cx.notify();
+    }
+
     fn render_api_key_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = ThemeSettings::get_global(cx);
         let text_style = TextStyle {
@@ -1002,80 +1228,140 @@ impl ConfigurationView {
 
 impl Render for ConfigurationView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let env_var_set = self.state.read(cx).api_key_from_env;
+        let _env_var_set = match &self.state.read(cx).auth_method {
+            AnthropicAuthMethod::ApiKey { from_env, .. } => *from_env,
+            _ => false,
+        };
 
         if self.load_credentials_task.is_some() {
             div().child(Label::new("Loading credentials...")).into_any()
         } else if self.should_render_editor(cx) {
             v_flex()
                 .size_full()
-                .on_action(cx.listener(Self::save_api_key))
-                .child(Label::new("To use Zed's assistant with Anthropic, you need to add an API key. Follow these steps:"))
+                .gap_4()
                 .child(
-                    List::new()
+                    v_flex()
+                        .gap_2()
+                        .child(Label::new("Have a Claude Pro or Max subscription? Use it instead of API credits."))
                         .child(
-                            InstructionListItem::new(
-                                "Create one by visiting",
-                                Some("Anthropic's settings"),
-                                Some("https://console.anthropic.com/settings/keys")
-                            )
-                        )
-                        .child(
-                            InstructionListItem::text_only("Paste your API key below and hit enter to start using the assistant")
+                            Button::new("oauth-authenticate", "Authenticate with Claude Pro/Max")
+                                .style(ButtonStyle::Filled)
+                                .icon(Some(IconName::ExternalLink))
+                                .icon_position(IconPosition::End)
+                                .on_click(cx.listener(|this, _, window, cx| this.start_oauth_authentication(window, cx)))
                         )
                 )
                 .child(
-                    h_flex()
+                    div()
                         .w_full()
-                        .my_2()
-                        .px_2()
-                        .py_1()
-                        .bg(cx.theme().colors().editor_background)
-                        .border_1()
-                        .border_color(cx.theme().colors().border)
-                        .rounded_sm()
-                        .child(self.render_api_key_editor(cx)),
+                        .h_px()
+                        .bg(cx.theme().colors().border)
                 )
                 .child(
-                    Label::new(
-                        format!("You can also assign the {ANTHROPIC_API_KEY_VAR} environment variable and restart Zed."),
-                    )
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
+                    v_flex()
+                        .size_full()
+                        .on_action(cx.listener(Self::save_api_key))
+                        .child(Label::new("To use Zed's assistant with Anthropic, you need to add an API key. Follow these steps:"))
+                        .child(
+                            List::new()
+                                .child(
+                                    InstructionListItem::new(
+                                        "Create one by visiting",
+                                        Some("Anthropic's settings"),
+                                        Some("https://console.anthropic.com/settings/keys")
+                                    )
+                                )
+                                .child(
+                                    InstructionListItem::text_only("Paste your API key below and hit enter to start using the assistant")
+                                )
+                        )
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .my_2()
+                                .px_2()
+                                .py_1()
+                                .bg(cx.theme().colors().editor_background)
+                                .border_1()
+                                .border_color(cx.theme().colors().border)
+                                .rounded_sm()
+                                .child(self.render_api_key_editor(cx)),
+                        )
+                        .child(
+                            Label::new(
+                                format!("You can also assign the {ANTHROPIC_API_KEY_VAR} environment variable and restart Zed."),
+                            )
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        )
                 )
                 .into_any()
         } else {
-            h_flex()
-                .mt_1()
-                .p_1()
-                .justify_between()
-                .rounded_md()
-                .border_1()
-                .border_color(cx.theme().colors().border)
-                .bg(cx.theme().colors().background)
-                .child(
+            match &self.state.read(cx).auth_method {
+                AnthropicAuthMethod::OAuth { tokens: _ } => {
+                    v_flex()
+                        .mt_1()
+                        .p_2()
+                        .gap_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(cx.theme().colors().border)
+                        .bg(cx.theme().colors().background)
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(Icon::new(IconName::Check).color(Color::Success))
+                                .child(Label::new("You have access to Anthropic through your Claude Pro/Max subscription.")),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    Button::new("reset-oauth", "Sign Out")
+                                        .label_size(LabelSize::Small)
+                                        .on_click(cx.listener(|this, _, window, cx| this.reset_api_key(window, cx))),
+                                )
+                        )
+                        .into_any()
+                }
+                AnthropicAuthMethod::ApiKey { from_env, .. } => {
                     h_flex()
-                        .gap_1()
-                        .child(Icon::new(IconName::Check).color(Color::Success))
-                        .child(Label::new(if env_var_set {
-                            format!("API key set in {ANTHROPIC_API_KEY_VAR} environment variable.")
-                        } else {
-                            "API key configured.".to_string()
-                        })),
-                )
-                .child(
-                    Button::new("reset-key", "Reset Key")
-                        .label_size(LabelSize::Small)
-                        .icon(Some(IconName::Trash))
-                        .icon_size(IconSize::Small)
-                        .icon_position(IconPosition::Start)
-                        .disabled(env_var_set)
-                        .when(env_var_set, |this| {
-                            this.tooltip(Tooltip::text(format!("To reset your API key, unset the {ANTHROPIC_API_KEY_VAR} environment variable.")))
-                        })
-                        .on_click(cx.listener(|this, _, window, cx| this.reset_api_key(window, cx))),
-                )
-                .into_any()
+                        .mt_1()
+                        .p_1()
+                        .justify_between()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(cx.theme().colors().border)
+                        .bg(cx.theme().colors().background)
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(Icon::new(IconName::Check).color(Color::Success))
+                                .child(Label::new(if *from_env {
+                                    format!("API key set in {ANTHROPIC_API_KEY_VAR} environment variable.")
+                                } else {
+                                    "API key configured.".to_string()
+                                })),
+                        )
+                        .child(
+                            Button::new("reset-key", "Reset Key")
+                                .label_size(LabelSize::Small)
+                                .icon(Some(IconName::Trash))
+                                .icon_size(IconSize::Small)
+                                .icon_position(IconPosition::Start)
+                                .disabled(*from_env)
+                                .when(*from_env, |this| {
+                                    this.tooltip(Tooltip::text(format!("To reset your API key, unset the {ANTHROPIC_API_KEY_VAR} environment variable.")))
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| this.reset_api_key(window, cx))),
+                        )
+                        .into_any()
+                }
+                AnthropicAuthMethod::None => {
+                    // This should not happen since should_render_editor would be true
+                    div().into_any()
+                }
+            }
         }
     }
 }

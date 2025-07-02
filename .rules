@@ -128,3 +128,7 @@ GPUI has had some changes to its APIs. Always write code using the new APIs:
 ## General guidelines
 
 - Use `./script/clippy` instead of `cargo clippy`
+
+# Project Documentation
+
+- Claude Pro/Max OAuth integration documentation: `private/claude-pro-max/README.md`

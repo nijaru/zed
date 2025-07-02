@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use strum::{EnumIter, EnumString};
 use thiserror::Error;
 
+pub mod oauth;
+
 pub const ANTHROPIC_API_URL: &str = "https://api.anthropic.com";
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -385,6 +387,17 @@ pub async fn stream_completion(
         .map(|output| output.0)
 }
 
+pub async fn stream_completion_oauth(
+    client: &dyn HttpClient,
+    api_url: &str,
+    access_token: &str,
+    request: Request,
+) -> Result<BoxStream<'static, Result<Event, AnthropicError>>, AnthropicError> {
+    stream_completion_oauth_with_rate_limit_info(client, api_url, access_token, request)
+        .await
+        .map(|output| output.0)
+}
+
 /// An individual rate limit.
 #[derive(Debug)]
 pub struct RateLimit {
@@ -544,6 +557,98 @@ pub async fn stream_completion_with_rate_limit_info(
         match serde_json::from_str::<Event>(&body) {
             Ok(Event::Error { error }) => Err(AnthropicError::ApiError(error)),
             Ok(_) | Err(_) => Err(AnthropicError::HttpResponseError {
+                status_code: response.status(),
+                message: body,
+            }),
+        }
+    }
+}
+
+pub async fn stream_completion_oauth_with_rate_limit_info(
+    client: &dyn HttpClient,
+    api_url: &str,
+    access_token: &str,
+    request: Request,
+) -> Result<
+    (
+        BoxStream<'static, Result<Event, AnthropicError>>,
+        Option<RateLimitInfo>,
+    ),
+    AnthropicError,
+> {
+    let request = StreamingRequest {
+        base: request,
+        stream: true,
+    };
+    let uri = format!("{api_url}/v1/messages");
+    let beta_headers = Model::from_id(&request.base.model)
+        .map(|model| {
+            let headers = model.beta_headers();
+            // Add OAuth beta header for Claude Pro/Max support
+            if headers.contains("oauth-2025-04-20") {
+                headers
+            } else {
+                format!("{},oauth-2025-04-20", headers)
+            }
+        })
+        .unwrap_or_else(|_| {
+            format!("{},oauth-2025-04-20", Model::DEFAULT_BETA_HEADERS.join(","))
+        });
+    
+    let request_builder = HttpRequest::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("Anthropic-Version", "2023-06-01")
+        .header("Anthropic-Beta", beta_headers)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("Content-Type", "application/json");
+    
+    let serialized_request =
+        serde_json::to_string(&request).map_err(AnthropicError::SerializeRequest)?;
+    let request = request_builder
+        .body(AsyncBody::from(serialized_request))
+        .map_err(AnthropicError::BuildRequestBody)?;
+
+    let mut response = client
+        .send(request)
+        .await
+        .map_err(AnthropicError::HttpSend)?;
+    let rate_limits = RateLimitInfo::from_headers(response.headers());
+    if response.status().is_success() {
+        let reader = BufReader::new(response.into_body());
+        let stream = reader
+            .lines()
+            .filter_map(|line| async move {
+                match line {
+                    Ok(line) => {
+                        let line = line.strip_prefix("data: ")?;
+                        match serde_json::from_str(line) {
+                            Ok(response) => Some(Ok(response)),
+                            Err(error) => Some(Err(AnthropicError::DeserializeResponse(error))),
+                        }
+                    }
+                    Err(error) => Some(Err(AnthropicError::ReadResponse(error))),
+                }
+            })
+            .boxed();
+        Ok((stream, Some(rate_limits)))
+    } else if let Some(retry_after) = rate_limits.retry_after {
+        Err(AnthropicError::RateLimit { retry_after })
+    } else {
+        let mut body = String::new();
+        response
+            .body_mut()
+            .read_to_string(&mut body)
+            .await
+            .map_err(AnthropicError::ReadResponse)?;
+
+        match serde_json::from_str::<Event>(&body) {
+            Ok(Event::Error { error }) => Err(AnthropicError::ApiError(error)),
+            Ok(_) => Err(AnthropicError::HttpResponseError {
+                status_code: response.status(),
+                message: format!("Unexpected response format: {}", body),
+            }),
+            Err(_) => Err(AnthropicError::HttpResponseError {
                 status_code: response.status(),
                 message: body,
             }),
